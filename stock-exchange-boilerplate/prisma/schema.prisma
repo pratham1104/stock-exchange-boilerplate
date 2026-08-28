@@ -1,0 +1,76 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Side {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  LIMIT
+  MARKET
+}
+
+enum OrderStatus {
+  OPEN
+  PARTIALLY_FILLED
+  FILLED
+  CANCELLED
+}
+
+/**
+ * Read model for orders, kept in sync from OrderAccepted/TradeExecuted/OrderCancelled events.
+ * OrderAccepted, TradeExecuted, and OrderCancelled each live on their own Kafka topic, and Kafka
+ * only orders messages within a single topic/partition — so the consumer can (and, in practice,
+ * regularly does) see a trade for an order before that order's OrderAccepted event. Fills are
+ * therefore applied via upsert with a minimal stub row rather than assuming the order exists yet.
+ */
+model Order {
+  id             String      @id
+  symbol         String
+  side           Side
+  type           OrderType
+  price          Float?
+  quantity       Float
+  filledQuantity Float       @default(0)
+  status         OrderStatus @default(OPEN)
+  timestamp      DateTime
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([symbol])
+  @@index([status])
+}
+
+/**
+ * One row per TradeExecuted event. buyOrderId/sellOrderId are intentionally plain columns with
+ * no foreign key — see the note on Order above for why a hard FK doesn't hold up here.
+ */
+model Trade {
+  id        String   @id
+  symbol    String
+  price     Float
+  quantity  Float
+  timestamp DateTime
+  createdAt DateTime @default(now())
+
+  buyOrderId  String
+  sellOrderId String
+
+  @@index([symbol])
+  @@index([buyOrderId])
+  @@index([sellOrderId])
+}
