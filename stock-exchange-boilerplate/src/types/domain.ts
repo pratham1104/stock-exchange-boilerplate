@@ -4,6 +4,7 @@ export type OrderType = 'LIMIT' | 'MARKET';
 /** An order as submitted by a client, before the matching engine has touched it. */
 export interface IncomingOrder {
   id: string;
+  accountId: string; // owning account — set from the authenticated caller, not the request body
   symbol: string;
   side: Side;
   type: OrderType;
@@ -23,6 +24,8 @@ export interface Trade {
   symbol: string;
   buyOrderId: string;
   sellOrderId: string;
+  buyAccountId: string;
+  sellAccountId: string;
   price: number;
   quantity: number;
   timestamp: number;
@@ -38,6 +41,21 @@ export interface MatchResult {
   // remainingOrder to tell "fully filled" apart from "market order dropped
   // unfilled/partially filled" — both leave remainingOrder null.
   filledQuantity: number;
+}
+
+/** A holding: how many shares of a symbol an account owns. */
+export interface Position {
+  symbol: string;
+  quantity: number;
+}
+
+/** Public view of an account — balances and holdings, never the API key. */
+export interface AccountView {
+  id: string;
+  name: string;
+  cashBalance: number; // spendable now (excludes cash reserved by open buy orders)
+  reservedCash: number; // held against open buy orders
+  positions: Position[];
 }
 
 /** Published when an incoming order has been accepted by the matching engine. */
@@ -59,7 +77,28 @@ export interface OrderCancelledEvent {
   symbol: string;
 }
 
-export type ExchangeEvent = OrderAcceptedEvent | TradeExecutedEvent | OrderCancelledEvent;
+/**
+ * Published whenever an account's settled state changes (created, deposit,
+ * or a fill settled). Carries the full post-change snapshot so the read-model
+ * consumer can upsert without needing prior state.
+ */
+export interface AccountUpdatedEvent {
+  type: 'AccountUpdated';
+  account: {
+    id: string;
+    name: string;
+    cashBalance: number;
+    positions: Position[];
+  };
+  reason: 'created' | 'deposit' | 'settlement';
+  timestamp: number;
+}
+
+export type ExchangeEvent =
+  | OrderAcceptedEvent
+  | TradeExecutedEvent
+  | OrderCancelledEvent
+  | AccountUpdatedEvent;
 
 /** Aggregated view of an order book, grouped by price level rather than individual orders. */
 export interface BookSnapshot {

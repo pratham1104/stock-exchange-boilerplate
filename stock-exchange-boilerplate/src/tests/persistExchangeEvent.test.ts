@@ -5,6 +5,7 @@ import type {
   OrderAcceptedEvent,
   TradeExecutedEvent,
   OrderCancelledEvent,
+  AccountUpdatedEvent,
 } from '../types/domain';
 
 /**
@@ -30,6 +31,8 @@ const { db, FakePrismaError } = vi.hoisted(() => {
     db: {
       orders: new Map<string, Record<string, unknown>>(),
       trades: new Map<string, Record<string, unknown>>(),
+      accounts: new Map<string, Record<string, unknown>>(),
+      positions: [] as Array<Record<string, unknown>>,
     },
     FakePrismaError,
   };
@@ -93,6 +96,34 @@ vi.mock('../db/prisma', () => ({
         return { ...created };
       },
     },
+    account: {
+      upsert: async ({
+        where: { id },
+        create,
+        update,
+      }: {
+        where: { id: string };
+        create: Record<string, unknown>;
+        update: Record<string, unknown>;
+      }) => {
+        const row = db.accounts.get(id);
+        if (row) {
+          Object.assign(row, update);
+          return { ...row };
+        }
+        const created = { ...create };
+        db.accounts.set(id, created);
+        return { ...created };
+      },
+    },
+    position: {
+      deleteMany: async ({ where: { accountId } }: { where: { accountId: string } }) => {
+        db.positions = db.positions.filter((p) => p.accountId !== accountId);
+      },
+      createMany: async ({ data }: { data: Array<Record<string, unknown>> }) => {
+        db.positions.push(...data);
+      },
+    },
   },
 }));
 
@@ -119,6 +150,8 @@ const traded = (trade: Partial<Trade> = {}): TradeExecutedEvent => ({
     symbol: 'AAPL',
     buyOrderId: 'order-1',
     sellOrderId: 'order-2',
+    buyAccountId: 'buyer',
+    sellAccountId: 'seller',
     price: 100,
     quantity: 4,
     timestamp: Date.now(),
@@ -133,11 +166,20 @@ const cancelled = (over: Partial<OrderCancelledEvent> = {}): OrderCancelledEvent
   ...over,
 });
 
+const accountUpdated = (over: Partial<AccountUpdatedEvent['account']> = {}, reason: AccountUpdatedEvent['reason'] = 'settlement'): AccountUpdatedEvent => ({
+  type: 'AccountUpdated',
+  reason,
+  timestamp: Date.now(),
+  account: { id: 'acc-1', name: 'alice', cashBalance: 500, positions: [], ...over },
+});
+
 const order = (id: string) => db.orders.get(id);
 
 beforeEach(() => {
   db.orders.clear();
   db.trades.clear();
+  db.accounts.clear();
+  db.positions = [];
 });
 
 describe('persistExchangeEvent', () => {
@@ -283,6 +325,45 @@ describe('persistExchangeEvent', () => {
       await persistExchangeEvent(traded({ id: 'trade-1', buyOrderId: 'order-1', quantity: 4 }));
 
       expect(order('order-1')).toMatchObject({ status: 'CANCELLED' });
+    });
+  });
+
+  describe('TradeExecuted account ids', () => {
+    it('records both settlement counterparties on the trade row', async () => {
+      await persistExchangeEvent(
+        traded({ id: 'trade-1', buyAccountId: 'buyer-x', sellAccountId: 'seller-y' }),
+      );
+      expect(db.trades.get('trade-1')).toMatchObject({ buyAccountId: 'buyer-x', sellAccountId: 'seller-y' });
+    });
+  });
+
+  describe('AccountUpdated', () => {
+    it('upserts the account and its positions from the snapshot', async () => {
+      await persistExchangeEvent(
+        accountUpdated({ id: 'acc-1', name: 'alice', cashBalance: 750, positions: [{ symbol: 'AAPL', quantity: 5 }] }),
+      );
+
+      expect(db.accounts.get('acc-1')).toMatchObject({ name: 'alice', cashBalance: 750 });
+      expect(db.positions).toEqual([{ accountId: 'acc-1', symbol: 'AAPL', quantity: 5 }]);
+    });
+
+    it('replaces prior positions wholesale on each update', async () => {
+      await persistExchangeEvent(
+        accountUpdated({ id: 'acc-1', positions: [{ symbol: 'AAPL', quantity: 5 }, { symbol: 'MSFT', quantity: 2 }] }),
+      );
+      await persistExchangeEvent(
+        accountUpdated({ id: 'acc-1', cashBalance: 999, positions: [{ symbol: 'AAPL', quantity: 1 }] }),
+      );
+
+      expect(db.accounts.get('acc-1')).toMatchObject({ cashBalance: 999 });
+      expect(db.positions).toEqual([{ accountId: 'acc-1', symbol: 'AAPL', quantity: 1 }]);
+    });
+
+    it('clears positions when the snapshot has none', async () => {
+      await persistExchangeEvent(accountUpdated({ id: 'acc-1', positions: [{ symbol: 'AAPL', quantity: 5 }] }));
+      await persistExchangeEvent(accountUpdated({ id: 'acc-1', positions: [] }));
+
+      expect(db.positions).toEqual([]);
     });
   });
 });

@@ -1,7 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import { exchangeService } from '../engine/ExchangeService';
+import { tradingService } from '../engine/TradingService';
 import { prisma } from '../db/prisma';
+import { authenticate } from '../auth/apiKey';
 import { placeOrderSchema } from '../types/schemas';
 import { IncomingOrder, MatchResult } from '../types/domain';
 
@@ -51,50 +52,65 @@ function describeStatus(
 }
 
 /**
- * POST /api/orders — submit a new order (market or limit).
- * Validates the body against placeOrderSchema, assigns a server-side id and
- * timestamp, runs it through the matching engine, and reports the outcome.
+ * POST /api/orders — submit a new order (market or limit) for the authenticated
+ * account. Funds/shares are reserved before matching; an order the account
+ * can't cover is rejected with 422.
  */
-ordersRouter.post('/', asyncHandler(async (req: Request, res: Response) => {
-  const parsed = placeOrderSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() });
-  }
+ordersRouter.post(
+  '/',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = placeOrderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.flatten() });
+    }
 
-  const order: IncomingOrder = {
-    id: uuidv4(),
-    ...parsed.data,
-    timestamp: Date.now(),
-  };
+    const order: IncomingOrder = {
+      id: uuidv4(),
+      accountId: req.accountId as string,
+      ...parsed.data,
+      timestamp: Date.now(),
+    };
 
-  const result = await exchangeService.submitOrder(order);
+    const outcome = await tradingService.submitOrder(order);
+    if (outcome.status === 'rejected') {
+      return res.status(422).json({ error: 'Order rejected', reason: outcome.reason });
+    }
 
-  return res.status(201).json({
-    orderId: order.id,
-    trades: result.trades,
-    status: describeStatus(order, result),
-    remainingQuantity: result.remainingOrder
-      ? result.remainingOrder.quantity - result.remainingOrder.filledQuantity
-      : order.quantity - result.filledQuantity,
-  });
-}));
+    const { result } = outcome;
+    return res.status(201).json({
+      orderId: order.id,
+      trades: result.trades,
+      status: describeStatus(order, result),
+      remainingQuantity: result.remainingOrder
+        ? result.remainingOrder.quantity - result.remainingOrder.filledQuantity
+        : order.quantity - result.filledQuantity,
+    });
+  }),
+);
 
-/** DELETE /api/orders/:symbol/:orderId — cancel a resting order before it's filled. */
-ordersRouter.delete('/:symbol/:orderId', asyncHandler(async (req: Request, res: Response) => {
-  const { symbol, orderId } = req.params;
-  const removed = await exchangeService.cancelOrder(symbol, orderId);
+/** DELETE /api/orders/:symbol/:orderId — cancel a resting order you own. */
+ordersRouter.delete(
+  '/:symbol/:orderId',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { symbol, orderId } = req.params;
+    const outcome = await tradingService.cancelOrder(symbol, orderId, req.accountId as string);
 
-  if (!removed) {
-    return res.status(404).json({ error: 'Order not found or already filled' });
-  }
-
-  return res.status(200).json({ cancelled: removed.id });
-}));
+    if (outcome.status === 'forbidden') {
+      return res.status(403).json({ error: 'That order belongs to another account' });
+    }
+    if (outcome.status === 'not_found') {
+      return res.status(404).json({ error: 'Order not found or already filled' });
+    }
+    return res.status(200).json({ cancelled: outcome.order.id });
+  }),
+);
 
 /** GET /api/orders/:symbol/book — current aggregated bid/ask levels for a symbol (in-memory book). */
 ordersRouter.get('/:symbol/book', (req: Request, res: Response) => {
   const { symbol } = req.params;
-  return res.status(200).json(exchangeService.getSnapshot(symbol));
+  return res.status(200).json(tradingService.getSnapshot(symbol));
 });
 
 /**

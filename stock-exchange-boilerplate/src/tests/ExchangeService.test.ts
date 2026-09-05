@@ -16,6 +16,7 @@ const { ExchangeService } = await import('../engine/ExchangeService');
 
 const baseOrder = (overrides: Partial<IncomingOrder>): IncomingOrder => ({
   id: overrides.id ?? Math.random().toString(36).slice(2),
+  accountId: 'acct-1',
   symbol: 'AAPL',
   side: 'BUY',
   type: 'LIMIT',

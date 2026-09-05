@@ -126,6 +126,15 @@ export class ExchangeService extends EventEmitter {
     if (!book) return { symbol, bids: [], asks: [] };
     return book.toSnapshot();
   }
+
+  /**
+   * Cost to buy `quantity` right now by sweeping the ask side, plus how much is
+   * actually fillable. Used to size the cash reservation for a MARKET buy.
+   */
+  estimateBuyCost(symbol: string, quantity: number): { cost: number; fillable: number } {
+    const book = this.books.get(symbol);
+    return book ? book.estimateBuyCost(quantity) : { cost: 0, fillable: 0 };
+  }
 }
 
 // Singleton for this boilerplate. Swap for DI if the app grows.

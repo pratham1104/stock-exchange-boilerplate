@@ -14,6 +14,7 @@ export const TOPICS = {
   ORDER_ACCEPTED: 'order.accepted',
   TRADE_EXECUTED: 'trade.executed',
   ORDER_CANCELLED: 'order.cancelled',
+  ACCOUNT_UPDATED: 'account.updated',
 };
 
 // Single shared producer for the whole process; connected once at startup

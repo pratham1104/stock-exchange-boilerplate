@@ -67,10 +67,39 @@ model Trade {
   timestamp DateTime
   createdAt DateTime @default(now())
 
-  buyOrderId  String
-  sellOrderId String
+  buyOrderId    String
+  sellOrderId   String
+  buyAccountId  String
+  sellAccountId String
 
   @@index([symbol])
   @@index([buyOrderId])
   @@index([sellOrderId])
+  @@index([buyAccountId])
+  @@index([sellAccountId])
+}
+
+/**
+ * Read model for accounts, kept in sync from AccountUpdated events. Balances and holdings
+ * are authoritative in the API process (AccountService); this is the durable, queryable copy.
+ * API keys are never stored here — auth is in-memory only (see README).
+ */
+model Account {
+  id          String     @id
+  name        String
+  cashBalance Float      @default(0)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  positions   Position[]
+}
+
+/** One row per (account, symbol) holding. Replaced wholesale on each AccountUpdated for that account. */
+model Position {
+  accountId String
+  symbol    String
+  quantity  Float
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, symbol])
+  @@index([symbol])
 }

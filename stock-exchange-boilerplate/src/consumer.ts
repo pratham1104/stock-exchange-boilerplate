@@ -19,6 +19,11 @@ function logEvent(event: ExchangeEvent) {
     case 'OrderCancelled':
       console.log(`[OrderCancelled] ${event.orderId} ${event.symbol}`);
       break;
+    case 'AccountUpdated':
+      console.log(
+        `[AccountUpdated] ${event.account.id} (${event.reason}) cash=${event.account.cashBalance} positions=${event.account.positions.length}`,
+      );
+      break;
   }
 }
 

@@ -84,6 +84,7 @@ describe('market-data WebSocket', () => {
 
     await exchangeService.submitOrder({
       id: 'sell-1',
+      accountId: 'acct-md',
       symbol: 'MDWS2',
       side: 'SELL',
       type: 'LIMIT',
@@ -93,6 +94,7 @@ describe('market-data WebSocket', () => {
     });
     await exchangeService.submitOrder({
       id: 'buy-1',
+      accountId: 'acct-md',
       symbol: 'MDWS2',
       side: 'BUY',
       type: 'LIMIT',
@@ -123,6 +125,7 @@ describe('market-data WebSocket', () => {
 
     await exchangeService.submitOrder({
       id: 'buy-2',
+      accountId: 'acct-md',
       symbol: 'MDWS3',
       side: 'BUY',
       type: 'LIMIT',

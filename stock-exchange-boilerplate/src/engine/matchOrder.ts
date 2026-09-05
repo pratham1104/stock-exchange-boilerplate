@@ -36,6 +36,8 @@ export function matchOrder(incoming: IncomingOrder, book: OrderBook): MatchResul
       symbol: incoming.symbol,
       buyOrderId: incoming.side === 'BUY' ? incoming.id : top.id,
       sellOrderId: incoming.side === 'SELL' ? incoming.id : top.id,
+      buyAccountId: incoming.side === 'BUY' ? incoming.accountId : top.accountId,
+      sellAccountId: incoming.side === 'SELL' ? incoming.accountId : top.accountId,
       price: tradePrice,
       quantity: tradeQty,
       timestamp: Date.now(),

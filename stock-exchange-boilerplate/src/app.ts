@@ -2,6 +2,7 @@ import express, { Application, NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { ordersRouter } from './routes/orders';
+import { accountsRouter } from './routes/accounts';
 
 /**
  * Builds and configures the Express application.
@@ -21,6 +22,7 @@ export function createApp(): Application {
     res.status(200).json({ status: 'ok', timestamp: Date.now() });
   });
 
+  app.use('/api/accounts', accountsRouter);
   app.use('/api/orders', ordersRouter);
 
   // Catch-all for any route that didn't match above.

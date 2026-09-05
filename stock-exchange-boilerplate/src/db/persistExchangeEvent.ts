@@ -95,6 +95,8 @@ export async function persistExchangeEvent(event: ExchangeEvent): Promise<void> 
             timestamp: new Date(trade.timestamp),
             buyOrderId: trade.buyOrderId,
             sellOrderId: trade.sellOrderId,
+            buyAccountId: trade.buyAccountId,
+            sellAccountId: trade.sellAccountId,
           },
         });
       } catch (err) {
@@ -116,6 +118,28 @@ export async function persistExchangeEvent(event: ExchangeEvent): Promise<void> 
         where: { id: event.orderId },
         data: { status: 'CANCELLED' },
       });
+      break;
+    }
+
+    case 'AccountUpdated': {
+      // Each event carries the full post-change snapshot, so upsert the account and
+      // replace its positions wholesale — no need to reconcile against prior state.
+      const { account } = event;
+      await prisma.account.upsert({
+        where: { id: account.id },
+        create: { id: account.id, name: account.name, cashBalance: account.cashBalance },
+        update: { name: account.name, cashBalance: account.cashBalance },
+      });
+      await prisma.position.deleteMany({ where: { accountId: account.id } });
+      if (account.positions.length > 0) {
+        await prisma.position.createMany({
+          data: account.positions.map((p) => ({
+            accountId: account.id,
+            symbol: p.symbol,
+            quantity: p.quantity,
+          })),
+        });
+      }
       break;
     }
   }
