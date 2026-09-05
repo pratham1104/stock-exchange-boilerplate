@@ -7,10 +7,12 @@ import {
   OrderAcceptedEvent,
   TradeExecutedEvent,
   OrderCancelledEvent,
+  RestingOrder,
   Trade,
   BookSnapshot,
 } from '../types/domain';
 import { producer, TOPICS } from '../kafka/kafkaclient';
+import { logger } from '../logger';
 
 /** Typed events ExchangeService emits for in-process consumers (e.g. the WebSocket market-data layer). */
 export interface ExchangeServiceEvents {
@@ -61,7 +63,18 @@ export class ExchangeService extends EventEmitter {
     try {
       await producer.send({ topic, messages });
     } catch (err) {
-      console.error(`Failed to publish to ${topic}`, err);
+      logger.error({ err, topic }, 'Failed to publish to Kafka');
+    }
+  }
+
+  /**
+   * Rebuild books from orders that were resting when the process last stopped
+   * (loaded from Postgres on startup, oldest first). No matching, no events —
+   * just re-seat the resting orders in time priority.
+   */
+  hydrateBook(restingOrders: RestingOrder[]): void {
+    for (const order of restingOrders) {
+      this.getOrCreateBook(order.symbol).addOrder(order);
     }
   }
 

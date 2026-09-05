@@ -1,9 +1,13 @@
 import { EventEmitter } from 'events';
-import { randomUUID } from 'crypto';
-import { AccountView, IncomingOrder, Position, Trade } from '../types/domain';
-import { producer, TOPICS } from '../kafka/kafkaclient';
+import { randomUUID, createHash } from 'crypto';
+import { AccountView, IncomingOrder, Position, RestingOrder, Trade } from '../types/domain';
+import { AccountSnapshot } from '../db/persistence';
 
 const EPSILON = 1e-9;
+
+export function hashApiKey(rawKey: string): string {
+  return createHash('sha256').update(rawKey).digest('hex');
+}
 
 /** Thrown by reserveForOrder when the account can't cover the order. Caught and turned into a 422. */
 export class InsufficientFundsError extends Error {
@@ -14,15 +18,15 @@ export class InsufficientFundsError extends Error {
 }
 
 interface Holding {
-  quantity: number; // total owned
+  quantity: number; // total shares owned (settled)
   reserved: number; // held against open sell orders
 }
 
 interface InternalAccount {
   id: string;
   name: string;
-  apiKey: string;
-  cash: number; // spendable
+  apiKeyHash: string;
+  settledCash: number; // gross cash — NOT reduced by open buy-order reservations
   reservedCash: number; // held against open buy orders
   holdings: Map<string, Holding>;
 }
@@ -46,17 +50,22 @@ export interface AccountServiceEvents {
 }
 
 /**
- * In-memory, authoritative ledger — accounts, cash, holdings, and the
- * reservations backing open orders. Mirrors OrderBook/ExchangeService: fast
- * synchronous truth here, with an AccountUpdated event published to Kafka for
- * the durable Postgres read model.
+ * In-memory ledger — accounts, settled cash, holdings, and the reservations
+ * backing open orders. Postgres is the source of truth; this is a fast cache
+ * that TradingService keeps write-through-consistent with the database and
+ * that index.ts rebuilds via hydrate() on startup.
  *
- * Accounts (and their API keys) live only in this process and are lost on
- * restart — the same tradeoff as the in-memory book. Documented in the README.
+ * Cash model: `settledCash` is real money the account holds. `reservedCash` is
+ * a lien from open buy orders. Spendable = settledCash - reservedCash. Only
+ * settledCash is persisted; reservations are re-derived from the open Order
+ * rows on restart (rebuildReservation).
+ *
+ * API keys are never stored — only sha256(key). The raw key is returned once
+ * from createAccount and never again.
  */
 export class AccountService extends EventEmitter {
   private accounts = new Map<string, InternalAccount>();
-  private apiKeyIndex = new Map<string, string>(); // apiKey -> accountId
+  private hashIndex = new Map<string, string>(); // apiKeyHash -> accountId
   private reservations = new Map<string, Reservation>(); // orderId -> reservation
 
   on<K extends keyof AccountServiceEvents>(event: K, listener: AccountServiceEvents[K]): this {
@@ -82,56 +91,61 @@ export class AccountService extends EventEmitter {
     return h;
   }
 
-  private toView(account: InternalAccount): AccountView {
-    const positions: Position[] = [...account.holdings.entries()]
+  private spendable(account: InternalAccount): number {
+    return account.settledCash - account.reservedCash;
+  }
+
+  private positionsOf(account: InternalAccount): Position[] {
+    return [...account.holdings.entries()]
       .filter(([, h]) => h.quantity > EPSILON)
       .map(([symbol, h]) => ({ symbol, quantity: h.quantity }));
+  }
+
+  private toView(account: InternalAccount): AccountView {
     return {
       id: account.id,
       name: account.name,
-      cashBalance: account.cash,
+      cashBalance: this.spendable(account),
       reservedCash: account.reservedCash,
-      positions,
+      positions: this.positionsOf(account),
     };
   }
 
-  private async announce(account: InternalAccount, reason: 'created' | 'deposit' | 'settlement'): Promise<void> {
-    const view = this.toView(account);
-    this.emit('account', view);
-    try {
-      await producer.send({
-        topic: TOPICS.ACCOUNT_UPDATED,
-        messages: [
-          {
-            key: account.id,
-            value: JSON.stringify({
-              type: 'AccountUpdated',
-              account: { id: account.id, name: account.name, cashBalance: account.cash, positions: view.positions },
-              reason,
-              timestamp: Date.now(),
-            }),
-          },
-        ],
-      });
-    } catch (err) {
-      console.error('Failed to publish AccountUpdated', err);
-    }
+  private announce(account: InternalAccount): void {
+    this.emit('account', this.toView(account));
   }
 
-  // ---- lifecycle --------------------------------------------------------
+  // ---- lifecycle & persistence bridge ---------------------------------
 
-  async createAccount(name: string, startingCash = 0): Promise<{ view: AccountView; apiKey: string }> {
+  /** Creates an account in memory and returns the one-time raw API key. Caller must persist the snapshot. */
+  createAccount(name: string, startingCash = 0): { view: AccountView; apiKey: string } {
     const id = randomUUID();
     const apiKey = randomUUID();
-    const account: InternalAccount = { id, name, apiKey, cash: startingCash, reservedCash: 0, holdings: new Map() };
+    const apiKeyHash = hashApiKey(apiKey);
+    const account: InternalAccount = {
+      id,
+      name,
+      apiKeyHash,
+      settledCash: startingCash,
+      reservedCash: 0,
+      holdings: new Map(),
+    };
     this.accounts.set(id, account);
-    this.apiKeyIndex.set(apiKey, id);
-    await this.announce(account, 'created');
+    this.hashIndex.set(apiKeyHash, id);
+    this.announce(account);
     return { view: this.toView(account), apiKey };
   }
 
-  resolveApiKey(apiKey: string): string | null {
-    return this.apiKeyIndex.get(apiKey) ?? null;
+  /** Drop an account from memory — used to roll back a create whose DB write failed. */
+  forget(accountId: string): void {
+    const account = this.accounts.get(accountId);
+    if (!account) return;
+    this.hashIndex.delete(account.apiKeyHash);
+    this.accounts.delete(accountId);
+  }
+
+  resolveApiKey(rawKey: string): string | null {
+    return this.hashIndex.get(hashApiKey(rawKey)) ?? null;
   }
 
   getView(accountId: string): AccountView | null {
@@ -139,31 +153,74 @@ export class AccountService extends EventEmitter {
     return account ? this.toView(account) : null;
   }
 
-  /** Fund a demo account with cash and/or shares. Not a real settlement flow — see README. */
-  async deposit(
-    accountId: string,
-    deposit: { cash?: number; symbol?: string; quantity?: number },
-  ): Promise<AccountView> {
+  /** Full persistable state of one account (settled cash + holdings). */
+  snapshot(accountId: string): AccountSnapshot {
+    const account = this.require(accountId);
+    return {
+      id: account.id,
+      name: account.name,
+      apiKeyHash: account.apiKeyHash,
+      cashBalance: account.settledCash,
+      positions: this.positionsOf(account),
+    };
+  }
+
+  /** Replace one account's state from a snapshot — used for hydration and for rolling back a failed write. */
+  restore(snap: AccountSnapshot): void {
+    const existing = this.accounts.get(snap.id);
+    const reservedCash = existing?.reservedCash ?? 0;
+    const holdings = new Map<string, Holding>();
+    for (const p of snap.positions) {
+      holdings.set(p.symbol, { quantity: p.quantity, reserved: existing?.holdings.get(p.symbol)?.reserved ?? 0 });
+    }
+    // keep zero-quantity holdings that still carry a reservation
+    if (existing) {
+      for (const [symbol, h] of existing.holdings) {
+        if (!holdings.has(symbol) && h.reserved > EPSILON) holdings.set(symbol, { quantity: 0, reserved: h.reserved });
+      }
+    }
+    const account: InternalAccount = {
+      id: snap.id,
+      name: snap.name,
+      apiKeyHash: snap.apiKeyHash,
+      settledCash: snap.cashBalance,
+      reservedCash,
+      holdings,
+    };
+    if (existing && existing.apiKeyHash !== snap.apiKeyHash) this.hashIndex.delete(existing.apiKeyHash);
+    this.accounts.set(snap.id, account);
+    this.hashIndex.set(snap.apiKeyHash, snap.id);
+  }
+
+  /** Bulk-load accounts from Postgres on startup. Clears any prior in-memory state. */
+  hydrate(snapshots: AccountSnapshot[]): void {
+    this.accounts.clear();
+    this.hashIndex.clear();
+    this.reservations.clear();
+    for (const snap of snapshots) this.restore(snap);
+  }
+
+  /** Fund a demo account with cash and/or shares. Not a real settlement flow — see README. Caller must persist. */
+  deposit(accountId: string, deposit: { cash?: number; symbol?: string; quantity?: number }): AccountView {
     const account = this.require(accountId);
     if (deposit.cash != null) {
       if (deposit.cash <= 0) throw new Error('cash deposit must be positive');
-      account.cash += deposit.cash;
+      account.settledCash += deposit.cash;
     }
     if (deposit.symbol != null && deposit.quantity != null) {
       if (deposit.quantity <= 0) throw new Error('share deposit must be positive');
       this.holding(account, deposit.symbol).quantity += deposit.quantity;
     }
-    await this.announce(account, 'deposit');
+    this.announce(account);
     return this.toView(account);
   }
 
   // ---- reservations & settlement -------------------------------------
 
   /**
-   * Reserve funds/shares for an order before it hits the matching engine.
-   * `estimatedCost` is only consulted for MARKET buys (which have no limit
-   * price to reserve against) — the caller computes it by sweeping the book.
-   * Throws InsufficientFundsError if the account can't cover the order.
+   * Reserve funds/shares for a new order before it hits the matching engine.
+   * `estimatedCost` is only consulted for MARKET buys (no limit price to
+   * reserve against). Throws InsufficientFundsError if the account can't cover it.
    */
   reserveForOrder(order: IncomingOrder, estimatedCost: number): void {
     const account = this.require(order.accountId);
@@ -171,12 +228,11 @@ export class AccountService extends EventEmitter {
     if (order.side === 'BUY') {
       const needed = order.type === 'LIMIT' ? (order.price as number) * order.quantity : estimatedCost;
       const reservedShares = order.type === 'LIMIT' ? order.quantity : estimatedCost > EPSILON ? order.quantity : 0;
-      if (needed > account.cash + EPSILON) {
+      if (needed > this.spendable(account) + EPSILON) {
         throw new InsufficientFundsError(
-          `account has ${account.cash.toFixed(2)} available, order needs ${needed.toFixed(2)}`,
+          `account has ${this.spendable(account).toFixed(2)} available, order needs ${needed.toFixed(2)}`,
         );
       }
-      account.cash -= needed;
       account.reservedCash += needed;
       this.reservations.set(order.id, {
         accountId: order.accountId,
@@ -186,6 +242,7 @@ export class AccountService extends EventEmitter {
         perShareCash: reservedShares > 0 ? needed / reservedShares : 0,
         shares: 0,
       });
+      this.announce(account);
       return;
     }
 
@@ -205,6 +262,42 @@ export class AccountService extends EventEmitter {
       perShareCash: 0,
       shares: order.quantity,
     });
+    this.announce(account);
+  }
+
+  /**
+   * Rebuild the reservation for an order that was already resting before a
+   * restart. No funds check — the lien was committed pre-crash and `settledCash`
+   * loaded from Postgres already reflects every fill that settled.
+   */
+  rebuildReservation(order: RestingOrder): void {
+    const account = this.require(order.accountId);
+    const remaining = order.quantity - order.filledQuantity;
+    if (remaining <= EPSILON) return;
+
+    if (order.side === 'BUY') {
+      const price = order.price as number;
+      const cash = price * remaining;
+      account.reservedCash += cash;
+      this.reservations.set(order.id, {
+        accountId: order.accountId,
+        side: 'BUY',
+        symbol: order.symbol,
+        cash,
+        perShareCash: price,
+        shares: 0,
+      });
+    } else {
+      this.holding(account, order.symbol).reserved += remaining;
+      this.reservations.set(order.id, {
+        accountId: order.accountId,
+        side: 'SELL',
+        symbol: order.symbol,
+        cash: 0,
+        perShareCash: 0,
+        shares: remaining,
+      });
+    }
   }
 
   /** Move cash and shares between the two accounts for one fill, drawing down both reservations. */
@@ -217,10 +310,10 @@ export class AccountService extends EventEmitter {
     const seller = this.require(trade.sellAccountId);
     const actualCost = trade.price * trade.quantity;
 
-    // Buyer: consume reserved cash, refund the gap vs. actual price, receive shares.
+    // Buyer: consume reserved cash lien, pay the real cost, receive shares.
     const drawn = Math.min(buyRes.perShareCash * trade.quantity, buyRes.cash);
-    buyer.reservedCash -= drawn;
-    buyer.cash += drawn - actualCost;
+    buyer.reservedCash -= drawn; // release the lien for these shares
+    buyer.settledCash -= actualCost; // real money leaves (drawn - actualCost stays as spendable = the limit-vs-fill refund)
     buyRes.cash -= drawn;
     this.holding(buyer, trade.symbol).quantity += trade.quantity;
 
@@ -228,11 +321,14 @@ export class AccountService extends EventEmitter {
     const sellerHolding = this.holding(seller, trade.symbol);
     sellerHolding.quantity -= trade.quantity;
     sellerHolding.reserved -= trade.quantity;
-    seller.cash += actualCost;
+    seller.settledCash += actualCost;
     sellRes.shares -= trade.quantity;
 
     this.dropReservationIfDrained(trade.buyOrderId);
     this.dropReservationIfDrained(trade.sellOrderId);
+
+    this.announce(buyer);
+    this.announce(seller);
   }
 
   private dropReservationIfDrained(orderId: string): void {
@@ -255,7 +351,6 @@ export class AccountService extends EventEmitter {
       const release = res.cash - keep;
       if (release > EPSILON) {
         account.reservedCash -= release;
-        account.cash += release;
         res.cash = keep;
       }
     } else {
@@ -267,6 +362,7 @@ export class AccountService extends EventEmitter {
     }
 
     if (restingRemainingQty <= EPSILON) this.reservations.delete(orderId);
+    this.announce(account);
   }
 
   /** Account that owns the open order with this id, or null if there's no open reservation for it. */
@@ -282,17 +378,11 @@ export class AccountService extends EventEmitter {
 
     if (res.side === 'BUY' && res.cash > EPSILON) {
       account.reservedCash -= res.cash;
-      account.cash += res.cash;
     } else if (res.side === 'SELL' && res.shares > EPSILON) {
       this.holding(account, res.symbol).reserved -= res.shares;
     }
     this.reservations.delete(orderId);
-  }
-
-  /** Publish an account's current settled state (used after a batch of settlements). */
-  async publishState(accountId: string, reason: 'settlement' | 'deposit' | 'created' = 'settlement'): Promise<void> {
-    const account = this.accounts.get(accountId);
-    if (account) await this.announce(account, reason);
+    this.announce(account);
   }
 }
 

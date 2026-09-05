@@ -31,6 +31,13 @@ export interface Trade {
   timestamp: number;
 }
 
+/** Post-match state of a resting order that the incoming order traded against. */
+export interface MakerFill {
+  orderId: string;
+  totalQuantity: number;
+  filledQuantity: number; // cumulative, after this match
+}
+
 /** Outcome of running an incoming order through the matching engine. */
 export interface MatchResult {
   trades: Trade[];
@@ -41,6 +48,8 @@ export interface MatchResult {
   // remainingOrder to tell "fully filled" apart from "market order dropped
   // unfilled/partially filled" — both leave remainingOrder null.
   filledQuantity: number;
+  // Resting orders that were (partly) consumed — so their rows can be updated.
+  makerFills: MakerFill[];
 }
 
 /** A holding: how many shares of a symbol an account owns. */
@@ -78,27 +87,14 @@ export interface OrderCancelledEvent {
 }
 
 /**
- * Published whenever an account's settled state changes (created, deposit,
- * or a fill settled). Carries the full post-change snapshot so the read-model
- * consumer can upsert without needing prior state.
+ * The order/trade/cancel event stream published to Kafka. Postgres is the
+ * source of truth (the API write-throughs); this stream drives the market-data
+ * WebSocket and is available for external consumers / audit.
  */
-export interface AccountUpdatedEvent {
-  type: 'AccountUpdated';
-  account: {
-    id: string;
-    name: string;
-    cashBalance: number;
-    positions: Position[];
-  };
-  reason: 'created' | 'deposit' | 'settlement';
-  timestamp: number;
-}
+export type ExchangeEvent = OrderAcceptedEvent | TradeExecutedEvent | OrderCancelledEvent;
 
-export type ExchangeEvent =
-  | OrderAcceptedEvent
-  | TradeExecutedEvent
-  | OrderCancelledEvent
-  | AccountUpdatedEvent;
+/** Order lifecycle status as stored in Postgres. */
+export type StoredOrderStatus = 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
 
 /** Aggregated view of an order book, grouped by price level rather than individual orders. */
 export interface BookSnapshot {

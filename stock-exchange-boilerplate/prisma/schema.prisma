@@ -1,9 +1,6 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -29,17 +26,18 @@ enum OrderStatus {
   PARTIALLY_FILLED
   FILLED
   CANCELLED
+  REJECTED // a MARKET order that found no liquidity at all — recorded for history, never rests
 }
 
 /**
- * Read model for orders, kept in sync from OrderAccepted/TradeExecuted/OrderCancelled events.
- * OrderAccepted, TradeExecuted, and OrderCancelled each live on their own Kafka topic, and Kafka
- * only orders messages within a single topic/partition — so the consumer can (and, in practice,
- * regularly does) see a trade for an order before that order's OrderAccepted event. Fills are
- * therefore applied via upsert with a minimal stub row rather than assuming the order exists yet.
+ * Source of truth for orders. The API write-throughs every accept / fill / cancel here inside
+ * one transaction with the matching result, then rebuilds the in-memory book from the OPEN /
+ * PARTIALLY_FILLED rows on startup. `accountId` is the owning account (needed to rebuild the
+ * cash/share reservation for a resting order after a restart).
  */
 model Order {
   id             String      @id
+  accountId      String
   symbol         String
   side           Side
   type           OrderType
@@ -53,11 +51,13 @@ model Order {
 
   @@index([symbol])
   @@index([status])
+  @@index([accountId])
 }
 
 /**
- * One row per TradeExecuted event. buyOrderId/sellOrderId are intentionally plain columns with
- * no foreign key — see the note on Order above for why a hard FK doesn't hold up here.
+ * One row per fill. buyOrderId/sellOrderId are plain columns with no foreign key — an order row
+ * is written in the same transaction, but keeping these soft avoids ordering constraints and
+ * makes trade history cheap to query on its own.
  */
 model Trade {
   id        String   @id
@@ -80,20 +80,22 @@ model Trade {
 }
 
 /**
- * Read model for accounts, kept in sync from AccountUpdated events. Balances and holdings
- * are authoritative in the API process (AccountService); this is the durable, queryable copy.
- * API keys are never stored here — auth is in-memory only (see README).
+ * Source of truth for accounts. `cashBalance` is settled (gross) cash — cash reserved against
+ * open buy orders is NOT deducted here; the reservation is re-derived from the open Order rows
+ * on startup. `apiKeyHash` is sha256 of the API key (the raw key is shown once at creation and
+ * never stored). Written by the API inside the same transaction as the settlement that changed it.
  */
 model Account {
   id          String     @id
   name        String
+  apiKeyHash  String     @unique
   cashBalance Float      @default(0)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   positions   Position[]
 }
 
-/** One row per (account, symbol) holding. Replaced wholesale on each AccountUpdated for that account. */
+/** One row per (account, symbol) holding — total shares owned. Replaced wholesale on each account write. */
 model Position {
   accountId String
   symbol    String

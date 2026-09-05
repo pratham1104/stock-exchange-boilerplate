@@ -1,7 +1,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { accountService } from '../engine/AccountService';
+import { prisma } from '../db/prisma';
+import { writeAccountSnapshot } from '../db/persistence';
 import { authenticate } from '../auth/apiKey';
 import { createAccountSchema, depositSchema } from '../types/schemas';
+import { logger } from '../logger';
 
 export const accountsRouter = Router();
 
@@ -13,8 +16,9 @@ function asyncHandler(fn: (req: Request, res: Response) => Promise<unknown>) {
 
 /**
  * POST /api/accounts — open an account. Returns the account view and a one-time
- * API key; the key is never shown again, so the caller must store it. Open
- * (no auth) — this is how you get your first key.
+ * API key; the key is never shown again. Open (no auth) — this is how you get
+ * your first key. The account is written to Postgres before we return; if that
+ * write fails the in-memory account is rolled back and the caller gets a 503.
  */
 accountsRouter.post(
   '/',
@@ -23,7 +27,15 @@ accountsRouter.post(
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.flatten() });
     }
-    const { view, apiKey } = await accountService.createAccount(parsed.data.name, parsed.data.startingCash ?? 0);
+
+    const { view, apiKey } = accountService.createAccount(parsed.data.name, parsed.data.startingCash ?? 0);
+    try {
+      await writeAccountSnapshot(prisma, accountService.snapshot(view.id));
+    } catch (err) {
+      accountService.forget(view.id);
+      logger.error({ err }, 'failed to persist new account');
+      return res.status(503).json({ error: 'Could not create account, please retry' });
+    }
     return res.status(201).json({ account: view, apiKey });
   }),
 );
@@ -47,7 +59,16 @@ accountsRouter.post(
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.flatten() });
     }
-    const view = await accountService.deposit(req.accountId as string, parsed.data);
+    const accountId = req.accountId as string;
+    const before = accountService.snapshot(accountId);
+    const view = accountService.deposit(accountId, parsed.data);
+    try {
+      await writeAccountSnapshot(prisma, accountService.snapshot(accountId));
+    } catch (err) {
+      accountService.restore(before);
+      logger.error({ err, accountId }, 'failed to persist deposit');
+      return res.status(503).json({ error: 'Deposit not applied, please retry' });
+    }
     return res.status(200).json(view);
   }),
 );

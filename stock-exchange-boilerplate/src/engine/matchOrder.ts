@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { OrderBook } from './OrderBook';
-import { IncomingOrder, RestingOrder, MatchResult, Trade } from '../types/domain';
+import { IncomingOrder, RestingOrder, MatchResult, MakerFill, Trade } from '../types/domain';
 
 /**
  * Matches an incoming order against the resting book for its symbol.
@@ -12,6 +12,7 @@ import { IncomingOrder, RestingOrder, MatchResult, Trade } from '../types/domain
  */
 export function matchOrder(incoming: IncomingOrder, book: OrderBook): MatchResult {
   const trades: Trade[] = [];
+  const makerFills: MakerFill[] = [];
   const opposingSide: 'BUY' | 'SELL' = incoming.side === 'BUY' ? 'SELL' : 'BUY';
 
   let remainingQty = incoming.quantity;
@@ -44,20 +45,26 @@ export function matchOrder(incoming: IncomingOrder, book: OrderBook): MatchResul
     });
 
     book.consumeTop(opposingSide, tradeQty);
+    // `top` was mutated in place by consumeTop — record the maker's new state.
+    makerFills.push({
+      orderId: top.id,
+      totalQuantity: top.quantity,
+      filledQuantity: top.filledQuantity,
+    });
     remainingQty -= tradeQty;
   }
 
   const filledQty = incoming.quantity - remainingQty;
 
   if (remainingQty === 0) {
-    return { trades, remainingOrder: null, filledQuantity: filledQty };
+    return { trades, remainingOrder: null, filledQuantity: filledQty, makerFills };
   }
 
   if (incoming.type === 'MARKET') {
     // Market orders never rest on the book — unfilled remainder is just dropped/rejected.
     // filledQuantity may be 0 (no liquidity at all) or partial — the caller distinguishes
     // "fully filled" from "rejected"/"partially filled and rest dropped" using this value.
-    return { trades, remainingOrder: null, filledQuantity: filledQty };
+    return { trades, remainingOrder: null, filledQuantity: filledQty, makerFills };
   }
 
   // LIMIT order with leftover quantity: rests on the book.
@@ -67,5 +74,5 @@ export function matchOrder(incoming: IncomingOrder, book: OrderBook): MatchResul
   };
   book.addOrder(restingOrder);
 
-  return { trades, remainingOrder: restingOrder, filledQuantity: filledQty };
+  return { trades, remainingOrder: restingOrder, filledQuantity: filledQty, makerFills };
 }

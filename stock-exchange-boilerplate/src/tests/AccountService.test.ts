@@ -1,12 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-import type { IncomingOrder, Trade } from '../types/domain';
-
-vi.mock('../kafka/kafkaclient', () => ({
-  producer: { send: vi.fn().mockResolvedValue(undefined) },
-  TOPICS: { ACCOUNT_UPDATED: 'account.updated' },
-}));
-
-const { AccountService, InsufficientFundsError } = await import('../engine/AccountService');
+import { describe, it, expect, beforeEach } from 'vitest';
+import type { IncomingOrder, RestingOrder, Trade } from '../types/domain';
+import { AccountService, InsufficientFundsError, hashApiKey } from '../engine/AccountService';
 
 let svc: InstanceType<typeof AccountService>;
 
@@ -143,5 +137,77 @@ describe('settlement', () => {
 
     // 100 total reserved, 40 spent on the fill, 60 still held for the resting 6 @ 10.
     expect(svc.getView(buyer.id)).toMatchObject({ cashBalance: 900, reservedCash: 60 });
+  });
+});
+
+describe('API key hashing', () => {
+  it('never exposes the raw key and resolves via sha256', () => {
+    const { view, apiKey } = svc.createAccount('a', 0);
+    const snap = svc.snapshot(view.id);
+    expect(snap.apiKeyHash).toBe(hashApiKey(apiKey));
+    expect(JSON.stringify(snap)).not.toContain(apiKey);
+    expect(svc.resolveApiKey(apiKey)).toBe(view.id);
+  });
+});
+
+describe('snapshot / restore / hydrate', () => {
+  it('snapshot is settled (gross) cash, not spendable', () => {
+    const { view } = svc.createAccount('a', 1000);
+    svc.reserveForOrder(order({ id: 'o', accountId: view.id, side: 'BUY', price: 10, quantity: 10 }), 0);
+    expect(svc.getView(view.id).cashBalance).toBe(900); // spendable
+    expect(svc.snapshot(view.id).cashBalance).toBe(1000); // settled
+  });
+
+  it('hydrate rebuilds accounts and their key index from snapshots', () => {
+    const id = 'acc-x';
+    svc.hydrate([{ id, name: 'restored', apiKeyHash: hashApiKey('the-key'), cashBalance: 250, positions: [{ symbol: 'ZZ', quantity: 4 }] }]);
+    expect(svc.resolveApiKey('the-key')).toBe(id);
+    expect(svc.getView(id)).toMatchObject({ cashBalance: 250, positions: [{ symbol: 'ZZ', quantity: 4 }] });
+  });
+
+  it('restore rolls an account back to a prior snapshot', () => {
+    const { view } = svc.createAccount('a', 100);
+    const before = svc.snapshot(view.id);
+    svc.deposit(view.id, { cash: 900 });
+    expect(svc.getView(view.id).cashBalance).toBe(1000);
+    svc.restore(before);
+    expect(svc.getView(view.id).cashBalance).toBe(100);
+  });
+
+  it('forget removes an account and its key', () => {
+    const { view, apiKey } = svc.createAccount('a', 0);
+    svc.forget(view.id);
+    expect(svc.getView(view.id)).toBeNull();
+    expect(svc.resolveApiKey(apiKey)).toBeNull();
+  });
+});
+
+describe('rebuildReservation (restart recovery)', () => {
+  const resting = (o: Partial<RestingOrder>): RestingOrder => ({
+    id: 'r1',
+    accountId: 'a',
+    symbol: 'ABC',
+    side: 'BUY',
+    type: 'LIMIT',
+    price: 10,
+    quantity: 10,
+    filledQuantity: 0,
+    timestamp: 1,
+    ...o,
+  });
+
+  it('re-derives a BUY cash lien for the unfilled remainder without a funds check', () => {
+    svc.hydrate([{ id: 'a', name: 'a', apiKeyHash: hashApiKey('k'), cashBalance: 1000, positions: [] }]);
+    svc.rebuildReservation(resting({ accountId: 'a', side: 'BUY', price: 10, quantity: 10, filledQuantity: 4 }));
+    // 6 remaining @ 10 = 60 relien'd
+    expect(svc.getView('a')).toMatchObject({ cashBalance: 940, reservedCash: 60 });
+  });
+
+  it('re-derives a SELL share lien for the unfilled remainder', () => {
+    svc.hydrate([{ id: 'a', name: 'a', apiKeyHash: hashApiKey('k'), cashBalance: 0, positions: [{ symbol: 'ABC', quantity: 10 }] }]);
+    svc.rebuildReservation(resting({ accountId: 'a', side: 'SELL', price: 10, quantity: 10, filledQuantity: 3 }));
+    // 7 reserved -> only 3 free to sell
+    const order2 = { id: 'x', accountId: 'a', symbol: 'ABC', side: 'SELL', type: 'LIMIT', price: 10, quantity: 4, timestamp: 2 } as const;
+    expect(() => svc.reserveForOrder(order2, 0)).toThrow(InsufficientFundsError);
   });
 });

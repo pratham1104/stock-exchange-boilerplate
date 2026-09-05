@@ -96,14 +96,12 @@ describe('ExchangeService event publishing', () => {
 
   it('swallows publish failures so order submission still succeeds', async () => {
     send.mockRejectedValueOnce(new Error('broker down'));
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
     const service = new ExchangeService();
 
     const result = await service.submitOrder(baseOrder({ id: 'buy-1' }));
 
+    // The order still rests despite the publish failing (best-effort publishing).
     expect(result.remainingOrder).not.toBeNull();
-    expect(consoleError).toHaveBeenCalled();
-    consoleError.mockRestore();
   });
 });
 

@@ -1,72 +1,72 @@
-# Stock Exchange Boilerplate — Express + TypeScript
+# Stock Exchange — Express + TypeScript
 
-A tested matching engine and ledger behind a thin Express API:
+A matching engine and ledger behind a REST + WebSocket API, with **Postgres as
+the source of truth**. State is rebuilt from the database on startup, so a crash
+recovers exactly.
 
-- **Matching engine** — price-time priority, per-symbol order books, in-memory and authoritative
+- **Matching engine** — price-time priority, per-symbol order books (price-level buckets)
 - **Accounts & settlement** — cash + share balances, funds reserved when an order is placed, cash and shares moved between accounts as fills happen
-- **Auth** — per-account API keys (bearer tokens)
-- **Event log** — every accept / trade / cancel / account change is published to Kafka
-- **Read model** — a separate consumer projects those events into Postgres for durable, queryable history
+- **Auth** — per-account API keys (bearer tokens); only sha256(key) is ever stored
+- **Write-through persistence** — every accept / fill / cancel and both accounts' new balances land in Postgres in one transaction, alongside the match
+- **Startup rehydration** — the in-memory ledger and books are rebuilt from Postgres before the server accepts traffic
 - **Market data** — live trade + order-book updates over WebSocket
+- **Ops** — `/health` + `/health/ready`, graceful shutdown, fail-fast config validation, per-account rate limiting, structured logs (pino)
 
-Covers Phases 1–6 of the roadmap. Still open: multi-instance sharding, and a
-real deposit/withdrawal + KYC flow (the current deposit endpoint is a demo shim).
+## Architecture
+
+```
+                          ┌──────────────── API process ────────────────┐
+POST /api/orders  ──▶  TradingService (per-symbol lock)                  │
+  (authenticated)        1. reserve funds/shares         AccountService  │  in-memory,
+  rate-limited           2. match                        OrderBook       │  rebuilt from
+                         3. settle each fill             AccountService  │  Postgres on boot
+                         4. write order + trades + both accounts ──────────▶ Postgres  ◀── SOURCE OF TRUTH
+                            in ONE transaction                           │      ▲
+                         5. publish order.accepted / trade.executed ─────────┐ │
+                                                                        │    │ │ rehydrate()
+GET /health/ready ──▶ pings Postgres, checks consistency flag           │    │ │ on startup
+GET /api/accounts/me, /orders/:symbol/book ──▶ in-memory (current)      │    ▼ │
+GET /api/orders/:id, /orders/:symbol/trades ──▶ Postgres                │  ExchangeService emits
+                          └──────────────────────────────────────────────┘  'trade'/'book' ──▶ ws/marketData ──▶ WS clients
+                                                                            │
+                                                             Kafka ◀────────┘  (market data + optional external consumers;
+                                                                                NOT required for correctness)
+```
+
+Key decisions:
+
+- **Postgres is authoritative.** The in-memory ledger and books are a fast cache. `index.ts` rebuilds them from Postgres (`loadAccountSnapshots`, `loadOpenOrders` → `AccountService.hydrate`, `ExchangeService.hydrateBook`, `rebuildReservation`) before `listen()`. A `SIGKILL` mid-trade recovers: any order/trade the transaction didn't commit simply isn't there, and the counterparty's resting order comes back.
+- **One transaction per operation.** An order, its fills, the maker-order updates, and both accounts' balances commit atomically or not at all (`prisma.$transaction`).
+- **Fail-stop on a persistence failure.** If the transaction throws after the in-memory mutation, the service is marked degraded → `/health/ready` returns 503 → the orchestrator restarts it → rehydration reconciles. There is deliberately no in-memory rollback of a settled trade.
+- **Per-symbol serialization.** `TradingService` holds a promise-chain lock per symbol so concurrent submissions can't interleave across `await` points.
+- **Cash model.** `Account.cashBalance` is *settled* (gross) cash. Cash reserved by open buy orders is **not** deducted in the DB — the reservation is re-derived from the open `Order` rows on restart. `spendable = cashBalance − reservedCash` (shown as `cashBalance` in `GET /me`).
+- **Kafka is not load-bearing.** `order.accepted` / `trade.executed` / `order.cancelled` drive the market-data WebSocket and are available for external consumers. Publishing is best-effort; a broker outage never blocks a trade. `src/consumer.ts` is an *example* stream consumer (logs events) — the API owns all Postgres writes.
 
 ## Structure
 ```
 src/
-  types/domain.ts            Core types: Order, Trade, MatchResult, Position, AccountView, events
+  config.ts                  Validated env — throws at boot if a required var is missing
+  logger.ts                  pino (pretty in dev, JSON in prod)
+  types/domain.ts            Core types + the Kafka event union
   types/schemas.ts           Zod request validation
-  types/express.d.ts         Request augmentation for req.accountId
-  auth/apiKey.ts             Bearer-token auth middleware (in-memory key index)
-  engine/OrderBook.ts        Per-symbol book: price-level buckets, best-first, FIFO within a level
-  engine/matchOrder.ts       Pure matching function — no I/O, fully unit tested
-  engine/ExchangeService.ts  Registry of OrderBooks; Kafka order/trade events; in-process 'trade'/'book'
-  engine/AccountService.ts   In-memory ledger: cash, holdings, per-order reservations; AccountUpdated events
-  engine/TradingService.ts   Composes the two: reserve -> match -> settle -> release
-  kafka/kafkaclient.ts       Shared Kafka client + producer, topic names
-  db/prisma.ts               Shared PrismaClient
-  db/persistExchangeEvent.ts Applies one event (order / trade / account) to the Postgres read model
-  ws/marketData.ts           WebSocket market-data fan-out (subscribe per symbol)
-  routes/orders.ts           Order + book + history endpoints
-  routes/accounts.ts         Account create / me / deposit
-  app.ts                     Express app + middleware
-  index.ts                   API entrypoint — Kafka producer, HTTP listen, WS attach
-  consumer.ts                Standalone consumer entrypoint — Kafka -> Postgres projection
-  tests/                     83 tests (matching, book structure, ledger/settlement, projection,
-                             WebSocket fan-out, HTTP routes)
-prisma/
-  schema.prisma              Order / Trade / Account / Position read-model tables
-  migrations/                SQL migrations
+  types/express.d.ts         Request augmentation (req.accountId)
+  auth/apiKey.ts             Bearer-token middleware (sha256 hash lookup)
+  http/rateLimit.ts          Dependency-free fixed-window limiter
+  engine/OrderBook.ts        Per-symbol book: price-level buckets, best-first, FIFO in a level
+  engine/matchOrder.ts       Pure matching function (returns trades + maker fills)
+  engine/ExchangeService.ts  Books registry; Kafka publish; 'trade'/'book' events; hydrateBook()
+  engine/AccountService.ts   In-memory ledger: settled cash, holdings, reservations; hydrate/snapshot/restore
+  engine/TradingService.ts   Orchestrator: lock → reserve → match → settle → write-through transaction
+  db/prisma.ts               PrismaClient + pingDatabase()
+  db/persistence.ts          Write-through helpers (order / trade / account rows)
+  db/rehydrate.ts            Startup loaders (accounts, open orders)
+  ws/marketData.ts           WebSocket market-data fan-out
+  routes/                    health, accounts, orders
+  app.ts / index.ts          App factory / entrypoint (validate → wait for DB → rehydrate → listen)
+  consumer.ts                Example Kafka consumer (optional, logs only)
+prisma/                      schema + migrations (Order / Trade / Account / Position)
+src/tests/                   97 tests, incl. a full crash-and-rehydrate integration test
 ```
-
-## Architecture
-
-Two processes, decoupled through Kafka. The matching engine and the ledger are
-both in-memory and authoritative in the API process; Postgres is a read model
-rebuilt from the event log by the consumer.
-
-```
-                    ┌─ TradingService ─ reserve funds (AccountService)
-HTTP POST /orders ──┤                   match (ExchangeService / OrderBook)
-   (authenticated)  │                   settle each fill (AccountService)
-                    └─ publish: order.accepted / trade.executed / account.updated ─┐
-                                                                                   │  Kafka
-HTTP GET /book, /accounts/me  ◀── in-memory (authoritative, current)               │
-                                                                                   ▼
-                            consumer (src/consumer.ts)  ─ persistExchangeEvent ─▶ Postgres
-                                                                                   │
-HTTP GET /orders/:id, /orders/:symbol/trades  ◀────────────────────────────────────┘
-
-ExchangeService also emits in-process 'trade'/'book' ─▶ ws/marketData.ts ─▶ WS clients
-```
-
-Design notes:
-- **Matching is synchronous and authoritative.** Kafka publishing is best-effort — a broker outage does not stop orders being accepted or settled.
-- **The consumer is at-least-once** (offsets commit after processing), idempotent on `trade.id`, and tolerant of out-of-order delivery across topics (a trade can land before its `OrderAccepted`; a stub row is created and corrected later).
-- **`AccountUpdated` events carry the full post-change snapshot**, so the read model upserts without reconciling against prior state.
-- **Accounts and API keys live only in the API process** and are lost on restart — the same tradeoff as the in-memory book. A real deployment would persist hashed keys and check them in `auth/apiKey.ts`.
-- **The WebSocket feed is per-instance** (fed from in-process events, not Kafka) — fine for one API process; Phase-6 sharding would move it to consuming the Kafka topics.
 
 ## Run it
 
@@ -74,100 +74,82 @@ Design notes:
 docker compose up -d          # kafka :9094, kafka-ui :8080, postgres :5432, adminer :8081
 npm install
 cp .env.example .env
-npx prisma migrate deploy     # apply migrations  (or: npx prisma migrate dev)
-npx prisma generate           # regenerate the client  (migrate dev does this for you)
-```
-
-Two processes, separate terminals:
-```bash
+npm run migrate:deploy        # apply migrations  (prisma migrate deploy)
+npm run build                 # runs `prisma generate` then tsc
 npm run dev                   # API on :4000, WS on ws://localhost:4000/ws/market-data
-npm run consumer              # Kafka -> Postgres projection
 ```
 
-> The consumer subscribes `fromBeginning`, so starting it late replays the full
-> event log and backfills Postgres. Without it, the in-memory endpoints and the
-> WebSocket feed still work; the Postgres-backed endpoints return 503.
+`npm run consumer` (optional) runs the example event-stream consumer.
 
 ```bash
-npm test        # 83 tests — no Kafka or Postgres needed (both mocked)
+npm test          # 97 tests — no Postgres or Kafka needed (both faked)
 npm run lint
-npm run build
 ```
 
 ## Accounts & auth
 
-Every order belongs to an account, identified by a bearer API key.
+Every order belongs to an account, identified by a bearer API key. Account
+creation is open (that's how you get your first key); everything else needs
+`Authorization: Bearer <apiKey>`.
 
 ```bash
-# 1. Open an account — the apiKey is shown once, store it
+# 1. open an account — apiKey is returned once, store it
 curl -sX POST localhost:4000/api/accounts \
-  -H 'content-type: application/json' \
-  -d '{"name":"alice","startingCash":100000}'
-# -> { "account": { "id": "...", "cashBalance": 100000, ... }, "apiKey": "..." }
+  -H 'content-type: application/json' -d '{"name":"alice","startingCash":100000}'
 
 # 2. (demo) fund it with shares so it can sell
 curl -sX POST localhost:4000/api/accounts/me/deposit \
-  -H 'authorization: Bearer <apiKey>' -H 'content-type: application/json' \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"symbol":"AAPL","quantity":500}'
 
 # 3. place an order
 curl -sX POST localhost:4000/api/orders \
-  -H 'authorization: Bearer <apiKey>' -H 'content-type: application/json' \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"symbol":"AAPL","side":"SELL","type":"LIMIT","price":150,"quantity":100}'
 ```
 
-When an order is placed, funds are **reserved**: a BUY holds `price × quantity`
-cash (a MARKET buy holds the cost to sweep the book right now); a SELL holds the
-shares. Reservations are drawn down as fills settle, and released on cancel or
-for the part of a MARKET order that couldn't fill. An order the account can't
-cover is rejected with **422**.
+Placing an order **reserves** funds: a BUY holds `price × quantity` cash (a MARKET
+buy holds the cost to sweep the book now); a SELL holds the shares. Reservations
+draw down as fills settle and are released on cancel / for the unfilled part of a
+MARKET order. An order the account can't cover is **422**.
 
 ## API
 
-Auth column: 🔑 = requires `Authorization: Bearer <apiKey>`.
+🔑 = requires `Authorization: Bearer <apiKey>`
 
-| Method | Path | Auth | Description |
+| Method | Path | | Description |
 | --- | --- | --- | --- |
-| POST | `/api/accounts` | — | Open an account; returns the account view + one-time API key |
-| GET | `/api/accounts/me` | 🔑 | Authenticated account's cash, reserved cash, and positions |
+| POST | `/api/accounts` | — | Open an account → account view + one-time API key |
+| GET | `/api/accounts/me` | 🔑 | Cash, reserved cash, positions (from memory — always current) |
 | POST | `/api/accounts/me/deposit` | 🔑 | Fund with `{cash}` and/or `{symbol,quantity}` (demo shim) |
-| POST | `/api/orders` | 🔑 | Place an order → `{ orderId, trades, status, remainingQuantity }` |
-| DELETE | `/api/orders/:symbol/:orderId` | 🔑 | Cancel a resting order you own (403 if it's another account's) |
-| GET | `/api/orders/:symbol/book` | — | Aggregated bid/ask levels (in-memory book, resets on restart) |
-| GET | `/api/orders/:symbol/trades` | — | Trade history from the Postgres read model (`?limit=`, 1–500, default 100) |
-| GET | `/api/orders/:id` | — | One order's status + fill progress from the read model |
-| GET | `/health` | — | Liveness probe |
+| POST | `/api/orders` | 🔑 | Place an order (rate-limited) → `{ orderId, trades, status, remainingQuantity }` |
+| DELETE | `/api/orders/:symbol/:orderId` | 🔑 | Cancel a resting order you own (403 for someone else's) |
+| GET | `/api/orders/:symbol/book` | — | Aggregated bid/ask levels (in-memory) |
+| GET | `/api/orders/:symbol/trades` | — | Trade history from Postgres (`?limit=`, 1–500) |
+| GET | `/api/orders/:id` | — | One order's status + fills from Postgres |
+| GET | `/health` | — | Liveness |
+| GET | `/health/ready` | — | Readiness — 503 if Postgres unreachable or state is degraded |
 
-`POST /api/orders` `status`: `OPEN` / `PARTIALLY_FILLED` / `FILLED` / `REJECTED`.
-`REJECTED` means a MARKET order found no liquidity at all (a LIMIT order never
-rejects — unfilled quantity rests). Insufficient funds is a `422`, not a status.
+`POST /api/orders` `status`: `OPEN` / `PARTIALLY_FILLED` / `FILLED` / `REJECTED`
+(`REJECTED` = a MARKET order with no liquidity). Insufficient funds → 422.
+`503` on a persistence failure (state is being reconciled — retry).
 
 ### WebSocket — `ws://localhost:4000/ws/market-data`
 
-- `{"type":"subscribe","symbol":"AAPL"}` — start receiving updates (an immediate `book` snapshot is sent); `{"type":"unsubscribe","symbol":"AAPL"}` to stop.
-- Inbound pushes: `{"type":"trade","trade":{...}}` per fill, `{"type":"book","snapshot":{...}}` on any book change.
-- Malformed frames and unknown message types are ignored, not errors.
+`{"type":"subscribe","symbol":"AAPL"}` → an immediate `book` snapshot, then
+`{"type":"trade",...}` per fill and `{"type":"book",...}` on any change.
+`{"type":"unsubscribe","symbol":"AAPL"}` to stop. Malformed frames are ignored.
 
-## Kafka topics
+## Production notes & what's still out of scope
 
-| Topic | Payload | Consumer action |
-| --- | --- | --- |
-| `order.accepted` | `OrderAccepted` | upsert Order row |
-| `trade.executed` | `TradeExecuted` | insert Trade row (idempotent on id), apply fills to both orders |
-| `order.cancelled` | `OrderCancelled` | mark Order `CANCELLED` |
-| `account.updated` | `AccountUpdated` (full snapshot) | upsert Account, replace its Positions |
+**In place:** durable state (crash recovery), atomic write-through, fail-stop +
+readiness probe, per-symbol serialization, API-key hashing, rate limiting,
+graceful shutdown, config validation, structured logging.
 
-## Environment
-```
-PORT=4000
-NODE_ENV=development
-DATABASE_URL="postgresql://exchange:exchange@localhost:5432/exchange?schema=public"
-KAFKA_BROKER=localhost:9094   # optional, this is the default
-```
+**Deliberately not built:**
 
-## Known simplifications to revisit
-- **Accounts / API keys are in-memory** — lost on restart, no persistence-backed auth. The Postgres `Account`/`Position` tables are a read model only (no key material).
-- **`/deposit` is a demo shim**, not a real funding/settlement system — no double-entry ledger, no external rails, no KYC.
-- **Single instance.** `OrderBook` uses price-level buckets in a sorted array (splice on a new level is O(L)); a balanced tree keyed by price would remove that. The WebSocket feed and the in-memory ledger both assume one API process.
-- **No read-your-writes on the read model** — `GET /api/orders/:id` can 404 briefly right after `POST` until the consumer catches up.
-- MARKET-buy affordability is checked against a *snapshot* of the book; a concurrent fill between the estimate and the match could in principle move the price (single-threaded Node makes this a non-issue today, but it's a real constraint under sharding).
+- **Horizontal scaling / sharding.** Single API process — the book, the ledger, and the per-symbol lock are in-process. Scaling out means partitioning symbols across instances (and moving the rate-limit counter to Redis, the market-data feed to Kafka-sourced).
+- **Real funding.** `/deposit` is a demo shim — no double-entry journal, no payment rails, no KYC/AML. A real system needs an append-only ledger table written in the same transaction as settlement.
+- **Throughput.** Persistence is on the order hot path (a few writes per order inside a transaction). Fine for typical loads; an HFT-grade engine would use a write-ahead log with async projection — the Kafka topics are already there for that.
+- **MARKET-buy affordability** is checked against a book *snapshot*; safe under single-threaded Node + the per-symbol lock, but a constraint to revisit under sharding.
+- No distributed tracing, TLS termination, secrets manager, or CI config — those are deployment concerns, not application code.

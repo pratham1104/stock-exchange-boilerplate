@@ -57,7 +57,23 @@ describe('matchOrder', () => {
     expect(result.remainingOrder?.quantity).toBe(10);
     expect(result.remainingOrder?.filledQuantity).toBe(5);
     expect(result.filledQuantity).toBe(5);
+    // the maker was fully consumed
+    expect(result.makerFills).toEqual([{ orderId: 'sell-1', totalQuantity: 5, filledQuantity: 5 }]);
     expect(book.getBestBid()?.id).toBe('buy-1'); // remainder now resting
+  });
+
+  it('reports maker fills so resting orders can be updated in the DB', () => {
+    const book = new OrderBook('AAPL');
+    matchOrder(baseOrder({ id: 'sell-a', side: 'SELL', price: 100, quantity: 4 }), book);
+    matchOrder(baseOrder({ id: 'sell-b', side: 'SELL', price: 101, quantity: 10 }), book);
+
+    const result = matchOrder(baseOrder({ id: 'buy-1', side: 'BUY', price: 101, quantity: 9 }), book);
+
+    // sell-a fully filled (4), sell-b partially filled (5 of 10)
+    expect(result.makerFills).toEqual([
+      { orderId: 'sell-a', totalQuantity: 4, filledQuantity: 4 },
+      { orderId: 'sell-b', totalQuantity: 10, filledQuantity: 5 },
+    ]);
   });
 
   it('market order fully filled against one resting order: remainingOrder null AND filledQuantity == quantity', () => {

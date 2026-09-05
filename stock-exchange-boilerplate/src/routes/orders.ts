@@ -3,8 +3,11 @@ import { v4 as uuidv4 } from 'uuid';
 import { tradingService } from '../engine/TradingService';
 import { prisma } from '../db/prisma';
 import { authenticate } from '../auth/apiKey';
+import { rateLimit } from '../http/rateLimit';
+import { config } from '../config';
 import { placeOrderSchema } from '../types/schemas';
 import { IncomingOrder, MatchResult } from '../types/domain';
+import { logger } from '../logger';
 
 export const ordersRouter = Router();
 
@@ -20,25 +23,23 @@ function asyncHandler(fn: (req: Request, res: Response) => Promise<unknown>) {
 }
 
 /**
- * The GET-by-id / trade-history endpoints read from the Postgres read model
- * that the Kafka consumer maintains (see src/consumer.ts). If the consumer
- * isn't running, or Postgres is unreachable, these return 503 rather than
- * a 500 — the in-memory book (POST / DELETE / GET book) is unaffected.
+ * The GET-by-id / trade-history endpoints read straight from Postgres (the
+ * source of truth, kept write-through-current by the API). If Postgres is
+ * unreachable they return 503; the in-memory book endpoint is unaffected.
  */
-async function fromReadModel(res: Response, respond: () => Promise<Response>): Promise<Response> {
+async function fromDatabase(res: Response, respond: () => Promise<Response>): Promise<Response> {
   try {
     return await respond();
   } catch (err) {
-    console.error('Read model query failed', err);
-    return res.status(503).json({ error: 'Read model unavailable' });
+    logger.error({ err }, 'order read query failed');
+    return res.status(503).json({ error: 'Database unavailable' });
   }
 }
 
 /**
- * Derives a client-facing status for a submitted order. remainingOrder is
- * null in two very different cases — fully filled, and a MARKET order whose
- * unfilled remainder was dropped (never rests) — so filledQuantity is what
- * actually distinguishes them.
+ * Client-facing status string. remainingOrder is null both when an order fully
+ * filled and when a MARKET order's unfilled remainder was dropped, so
+ * filledQuantity is what distinguishes them.
  */
 function describeStatus(
   order: IncomingOrder,
@@ -47,18 +48,25 @@ function describeStatus(
   if (result.remainingOrder) {
     return result.remainingOrder.filledQuantity > 0 ? 'PARTIALLY_FILLED' : 'OPEN';
   }
-  if (result.filledQuantity === 0) return 'REJECTED'; // no liquidity at all (MARKET only)
+  if (result.filledQuantity === 0) return 'REJECTED';
   return result.filledQuantity < order.quantity ? 'PARTIALLY_FILLED' : 'FILLED';
 }
 
+const orderRateLimit = rateLimit({
+  windowMs: 60_000,
+  max: config.orderRateLimitPerMinute,
+  key: (req) => req.accountId ?? req.ip ?? 'anon',
+});
+
 /**
- * POST /api/orders — submit a new order (market or limit) for the authenticated
- * account. Funds/shares are reserved before matching; an order the account
- * can't cover is rejected with 422.
+ * POST /api/orders — submit an order for the authenticated account. Funds/shares
+ * are reserved before matching; an order the account can't cover is rejected 422.
+ * The match + fills + balances are written to Postgres in one transaction.
  */
 ordersRouter.post(
   '/',
   authenticate,
+  orderRateLimit,
   asyncHandler(async (req: Request, res: Response) => {
     const parsed = placeOrderSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -75,6 +83,9 @@ ordersRouter.post(
     const outcome = await tradingService.submitOrder(order);
     if (outcome.status === 'rejected') {
       return res.status(422).json({ error: 'Order rejected', reason: outcome.reason });
+    }
+    if (outcome.status === 'error') {
+      return res.status(503).json({ error: 'Order could not be recorded, state is being reconciled' });
     }
 
     const { result } = outcome;
@@ -103,25 +114,28 @@ ordersRouter.delete(
     if (outcome.status === 'not_found') {
       return res.status(404).json({ error: 'Order not found or already filled' });
     }
+    if (outcome.status === 'error') {
+      return res.status(503).json({ error: 'Cancel could not be recorded, state is being reconciled' });
+    }
     return res.status(200).json({ cancelled: outcome.order.id });
   }),
 );
 
-/** GET /api/orders/:symbol/book — current aggregated bid/ask levels for a symbol (in-memory book). */
+/** GET /api/orders/:symbol/book — current aggregated bid/ask levels (in-memory book). */
 ordersRouter.get('/:symbol/book', (req: Request, res: Response) => {
   const { symbol } = req.params;
   return res.status(200).json(tradingService.getSnapshot(symbol));
 });
 
 /**
- * GET /api/orders/:symbol/trades — trade history for a symbol from the Postgres read model.
- * Most recent first; capped at 100. `?limit=` overrides (1–500).
+ * GET /api/orders/:symbol/trades — trade history for a symbol from Postgres.
+ * Most recent first; `?limit=` (1–500, default 100).
  */
 ordersRouter.get('/:symbol/trades', (req: Request, res: Response) => {
   const { symbol } = req.params;
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
 
-  return fromReadModel(res, async () => {
+  return fromDatabase(res, async () => {
     const trades = await prisma.trade.findMany({
       where: { symbol },
       orderBy: { timestamp: 'desc' },
@@ -131,17 +145,14 @@ ordersRouter.get('/:symbol/trades', (req: Request, res: Response) => {
   });
 });
 
-/**
- * GET /api/orders/:id — status and fill progress for a single order from the Postgres read model.
- * Survives an API restart, unlike GET book (which only knows the in-memory book).
- */
+/** GET /api/orders/:id — one order's status + fill progress from Postgres. */
 ordersRouter.get('/:id', (req: Request, res: Response) => {
   const { id } = req.params;
 
-  return fromReadModel(res, async () => {
+  return fromDatabase(res, async () => {
     const order = await prisma.order.findUnique({ where: { id } });
     if (!order) {
-      return res.status(404).json({ error: 'Order not found in read model' });
+      return res.status(404).json({ error: 'Order not found' });
     }
     return res.status(200).json(order);
   });

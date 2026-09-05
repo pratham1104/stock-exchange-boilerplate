@@ -3,6 +3,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { ordersRouter } from './routes/orders';
 import { accountsRouter } from './routes/accounts';
+import { healthRouter } from './routes/health';
+import { logger } from './logger';
 
 /**
  * Builds and configures the Express application.
@@ -12,16 +14,12 @@ import { accountsRouter } from './routes/accounts';
 export function createApp(): Application {
   const app = express();
 
-  // Security headers, permissive CORS, and JSON body parsing for all routes.
+  app.disable('x-powered-by');
   app.use(helmet());
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: '64kb' }));
 
-  // Basic liveness probe for load balancers / uptime checks.
-  app.get('/health', (_req: Request, res: Response) => {
-    res.status(200).json({ status: 'ok', timestamp: Date.now() });
-  });
-
+  app.use(healthRouter);
   app.use('/api/accounts', accountsRouter);
   app.use('/api/orders', ordersRouter);
 
@@ -32,8 +30,8 @@ export function createApp(): Application {
 
   // Central error handler — Express identifies this as an error handler by
   // its 4-arg signature, so it must stay last and keep the unused _next param.
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    console.error(err);
+  app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+    logger.error({ err, method: req.method, path: req.path }, 'unhandled request error');
     res.status(500).json({ error: 'Internal server error' });
   });
 

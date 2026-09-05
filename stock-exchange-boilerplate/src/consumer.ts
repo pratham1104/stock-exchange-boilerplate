@@ -1,65 +1,62 @@
-// Standalone process entry point for consuming exchange events off Kafka.
-// Runs separately from the API process (src/index.ts) — start with `npm run consumer`.
-import 'dotenv/config';
+// Example event-stream consumer. Postgres is the source of truth (the API
+// write-throughs), so this process is NOT required for correctness — it's here
+// to show how to consume the exchange event stream for a downstream concern
+// (analytics, notifications, a fraud check, an external ticker, ...).
+//
+// Run separately: `npm run consumer`.
+import './config';
 import { ExchangeEvent } from './types/domain';
 import { kafka, TOPICS } from './kafka/kafkaclient';
-import { persistExchangeEvent } from './db/persistExchangeEvent';
-import { prisma } from './db/prisma';
+import { logger } from './logger';
 
-const consumer = kafka.consumer({ groupId: 'exchange-events-consumer' });
+const consumer = kafka.consumer({ groupId: 'exchange-events-example' });
 
-function logEvent(event: ExchangeEvent) {
+function handle(event: ExchangeEvent): void {
   switch (event.type) {
     case 'OrderAccepted':
-      console.log(`[OrderAccepted] ${event.order.id} ${event.order.symbol} ${event.order.side} ${event.order.quantity}@${event.order.price ?? 'MARKET'}`);
+      logger.info(
+        { orderId: event.order.id, symbol: event.order.symbol, side: event.order.side, qty: event.order.quantity, price: event.order.price },
+        'OrderAccepted',
+      );
       break;
     case 'TradeExecuted':
-      console.log(`[TradeExecuted] ${event.trade.id} ${event.trade.symbol} ${event.trade.quantity}@${event.trade.price} (buy=${event.trade.buyOrderId} sell=${event.trade.sellOrderId})`);
+      logger.info(
+        { tradeId: event.trade.id, symbol: event.trade.symbol, qty: event.trade.quantity, price: event.trade.price },
+        'TradeExecuted',
+      );
       break;
     case 'OrderCancelled':
-      console.log(`[OrderCancelled] ${event.orderId} ${event.symbol}`);
-      break;
-    case 'AccountUpdated':
-      console.log(
-        `[AccountUpdated] ${event.account.id} (${event.reason}) cash=${event.account.cashBalance} positions=${event.account.positions.length}`,
-      );
+      logger.info({ orderId: event.orderId, symbol: event.symbol }, 'OrderCancelled');
       break;
   }
 }
 
-async function start() {
+async function start(): Promise<void> {
   await consumer.connect();
-  // This consumer maintains a materialized read model in Postgres, so a
-  // fresh consumer group must replay the full event log to reconstruct
-  // state rather than starting from "latest" and missing prior orders.
   await consumer.subscribe({ topics: Object.values(TOPICS), fromBeginning: true });
 
   await consumer.run({
     eachMessage: async ({ topic, message }: { topic: string; message: { value: Buffer | null } }) => {
       if (!message.value) return;
       try {
-        const event = JSON.parse(message.value.toString()) as ExchangeEvent;
-        logEvent(event);
-        await persistExchangeEvent(event);
+        handle(JSON.parse(message.value.toString()) as ExchangeEvent);
       } catch (err) {
-        console.error(`Failed to process message from ${topic}`, err);
+        logger.error({ err, topic }, 'failed to process message');
       }
     },
   });
 
-  console.log('Exchange events consumer running');
+  logger.info('exchange events example consumer running');
 
-  const shutdown = async () => {
-    await consumer.disconnect();
-    await prisma.$disconnect();
+  const shutdown = async (): Promise<void> => {
+    await consumer.disconnect().catch(() => undefined);
     process.exit(0);
   };
-
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
 }
 
 start().catch((err) => {
-  console.error('Failed to start consumer', err);
+  logger.fatal({ err }, 'failed to start consumer');
   process.exit(1);
 });
