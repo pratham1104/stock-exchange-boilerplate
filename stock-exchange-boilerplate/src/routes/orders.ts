@@ -1,11 +1,22 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { exchangeService } from '../engine/ExchangeService';
 import { prisma } from '../db/prisma';
 import { placeOrderSchema } from '../types/schemas';
-import { IncomingOrder } from '../types/domain';
+import { IncomingOrder, MatchResult } from '../types/domain';
 
 export const ordersRouter = Router();
+
+/**
+ * Express 4 does not forward a rejected promise from an async handler to the
+ * error middleware — it becomes an unhandled rejection and the request hangs.
+ * Wrap any handler that awaits into one that forwards failures to `next`.
+ */
+function asyncHandler(fn: (req: Request, res: Response) => Promise<unknown>) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    fn(req, res).catch(next);
+  };
+}
 
 /**
  * The GET-by-id / trade-history endpoints read from the Postgres read model
@@ -23,11 +34,28 @@ async function fromReadModel(res: Response, respond: () => Promise<Response>): P
 }
 
 /**
+ * Derives a client-facing status for a submitted order. remainingOrder is
+ * null in two very different cases — fully filled, and a MARKET order whose
+ * unfilled remainder was dropped (never rests) — so filledQuantity is what
+ * actually distinguishes them.
+ */
+function describeStatus(
+  order: IncomingOrder,
+  result: MatchResult,
+): 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'REJECTED' {
+  if (result.remainingOrder) {
+    return result.remainingOrder.filledQuantity > 0 ? 'PARTIALLY_FILLED' : 'OPEN';
+  }
+  if (result.filledQuantity === 0) return 'REJECTED'; // no liquidity at all (MARKET only)
+  return result.filledQuantity < order.quantity ? 'PARTIALLY_FILLED' : 'FILLED';
+}
+
+/**
  * POST /api/orders — submit a new order (market or limit).
  * Validates the body against placeOrderSchema, assigns a server-side id and
  * timestamp, runs it through the matching engine, and reports the outcome.
  */
-ordersRouter.post('/', async (req: Request, res: Response) => {
+ordersRouter.post('/', asyncHandler(async (req: Request, res: Response) => {
   const parsed = placeOrderSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.flatten() });
@@ -44,21 +72,15 @@ ordersRouter.post('/', async (req: Request, res: Response) => {
   return res.status(201).json({
     orderId: order.id,
     trades: result.trades,
-    // No remainingOrder means it fully filled; otherwise it's either still
-    // sitting untouched (OPEN) or partially matched before it started resting.
-    status: result.remainingOrder
-      ? result.remainingOrder.filledQuantity > 0
-        ? 'PARTIALLY_FILLED'
-        : 'OPEN'
-      : 'FILLED',
+    status: describeStatus(order, result),
     remainingQuantity: result.remainingOrder
       ? result.remainingOrder.quantity - result.remainingOrder.filledQuantity
-      : 0,
+      : order.quantity - result.filledQuantity,
   });
-});
+}));
 
 /** DELETE /api/orders/:symbol/:orderId — cancel a resting order before it's filled. */
-ordersRouter.delete('/:symbol/:orderId', async (req: Request, res: Response) => {
+ordersRouter.delete('/:symbol/:orderId', asyncHandler(async (req: Request, res: Response) => {
   const { symbol, orderId } = req.params;
   const removed = await exchangeService.cancelOrder(symbol, orderId);
 
@@ -67,7 +89,7 @@ ordersRouter.delete('/:symbol/:orderId', async (req: Request, res: Response) => 
   }
 
   return res.status(200).json({ cancelled: removed.id });
-});
+}));
 
 /** GET /api/orders/:symbol/book — current aggregated bid/ask levels for a symbol (in-memory book). */
 ordersRouter.get('/:symbol/book', (req: Request, res: Response) => {

@@ -105,3 +105,56 @@ describe('ExchangeService event publishing', () => {
     consoleError.mockRestore();
   });
 });
+
+describe('ExchangeService in-process event emission (consumed by the market-data WebSocket layer)', () => {
+  it('emits "book" but not "trade" when an order rests with no match', async () => {
+    const service = new ExchangeService();
+    const tradeListener = vi.fn();
+    const bookListener = vi.fn();
+    service.on('trade', tradeListener);
+    service.on('book', bookListener);
+
+    await service.submitOrder(baseOrder({ id: 'buy-1' }));
+
+    expect(tradeListener).not.toHaveBeenCalled();
+    expect(bookListener).toHaveBeenCalledTimes(1);
+    expect(bookListener).toHaveBeenCalledWith('AAPL', expect.objectContaining({ symbol: 'AAPL' }));
+  });
+
+  it('emits one "trade" per fill and a "book" refresh when an order crosses the book', async () => {
+    const service = new ExchangeService();
+    await service.submitOrder(baseOrder({ id: 'sell-1', side: 'SELL', price: 100, quantity: 10 }));
+    const tradeListener = vi.fn();
+    const bookListener = vi.fn();
+    service.on('trade', tradeListener);
+    service.on('book', bookListener);
+
+    const result = await service.submitOrder(baseOrder({ id: 'buy-1', side: 'BUY', price: 100, quantity: 10 }));
+
+    expect(result.trades).toHaveLength(1);
+    expect(tradeListener).toHaveBeenCalledTimes(1);
+    expect(tradeListener).toHaveBeenCalledWith(result.trades[0]);
+    expect(bookListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits "book" on a successful cancel', async () => {
+    const service = new ExchangeService();
+    await service.submitOrder(baseOrder({ id: 'buy-1' }));
+    const bookListener = vi.fn();
+    service.on('book', bookListener);
+
+    await service.cancelOrder('AAPL', 'buy-1');
+
+    expect(bookListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits nothing when cancelling a non-existent order', async () => {
+    const service = new ExchangeService();
+    const bookListener = vi.fn();
+    service.on('book', bookListener);
+
+    await service.cancelOrder('AAPL', 'missing');
+
+    expect(bookListener).not.toHaveBeenCalled();
+  });
+});

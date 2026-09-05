@@ -34,6 +34,10 @@ export interface MatchResult {
   // Order that was not fully filled and needs to rest on the book (if any).
   // null if fully filled or if a market order couldn't be filled at all.
   remainingOrder: RestingOrder | null;
+  // How much of the incoming order's quantity was matched. Needed alongside
+  // remainingOrder to tell "fully filled" apart from "market order dropped
+  // unfilled/partially filled" — both leave remainingOrder null.
+  filledQuantity: number;
 }
 
 /** Published when an incoming order has been accepted by the matching engine. */

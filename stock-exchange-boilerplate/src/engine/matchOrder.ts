@@ -48,12 +48,14 @@ export function matchOrder(incoming: IncomingOrder, book: OrderBook): MatchResul
   const filledQty = incoming.quantity - remainingQty;
 
   if (remainingQty === 0) {
-    return { trades, remainingOrder: null };
+    return { trades, remainingOrder: null, filledQuantity: filledQty };
   }
 
   if (incoming.type === 'MARKET') {
     // Market orders never rest on the book — unfilled remainder is just dropped/rejected.
-    return { trades, remainingOrder: null };
+    // filledQuantity may be 0 (no liquidity at all) or partial — the caller distinguishes
+    // "fully filled" from "rejected"/"partially filled and rest dropped" using this value.
+    return { trades, remainingOrder: null, filledQuantity: filledQty };
   }
 
   // LIMIT order with leftover quantity: rests on the book.
@@ -63,5 +65,5 @@ export function matchOrder(incoming: IncomingOrder, book: OrderBook): MatchResul
   };
   book.addOrder(restingOrder);
 
-  return { trades, remainingOrder: restingOrder };
+  return { trades, remainingOrder: restingOrder, filledQuantity: filledQty };
 }

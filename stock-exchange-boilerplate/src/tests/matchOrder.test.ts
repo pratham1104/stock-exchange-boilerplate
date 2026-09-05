@@ -23,6 +23,7 @@ describe('matchOrder', () => {
 
     expect(result.trades).toHaveLength(0);
     expect(result.remainingOrder).not.toBeNull();
+    expect(result.filledQuantity).toBe(0);
     expect(book.getBestBid()?.id).toBe(order.id);
   });
 
@@ -38,6 +39,7 @@ describe('matchOrder', () => {
     expect(result.trades[0].quantity).toBe(10);
     expect(result.trades[0].price).toBe(100);
     expect(result.remainingOrder).toBeNull();
+    expect(result.filledQuantity).toBe(10);
     expect(book.getBestAsk()).toBeNull(); // fully consumed
   });
 
@@ -53,10 +55,23 @@ describe('matchOrder', () => {
     expect(result.trades[0].quantity).toBe(5);
     expect(result.remainingOrder?.quantity).toBe(10);
     expect(result.remainingOrder?.filledQuantity).toBe(5);
+    expect(result.filledQuantity).toBe(5);
     expect(book.getBestBid()?.id).toBe('buy-1'); // remainder now resting
   });
 
-  it('market order fills against best available price and drops any unfilled remainder', () => {
+  it('market order fully filled against one resting order: remainingOrder null AND filledQuantity == quantity', () => {
+    const book = new OrderBook('AAPL');
+    matchOrder(baseOrder({ id: 'sell-1', side: 'SELL', price: 101, quantity: 10 }), book);
+
+    const marketBuy = baseOrder({ id: 'buy-1', side: 'BUY', type: 'MARKET', price: null, quantity: 10 });
+    const result = matchOrder(marketBuy, book);
+
+    expect(result.trades).toHaveLength(1);
+    expect(result.remainingOrder).toBeNull();
+    expect(result.filledQuantity).toBe(10);
+  });
+
+  it('market order partially fills and drops the unfilled remainder (remainingOrder null but filledQuantity < quantity)', () => {
     const book = new OrderBook('AAPL');
     matchOrder(baseOrder({ id: 'sell-1', side: 'SELL', price: 101, quantity: 3 }), book);
 
@@ -67,10 +82,13 @@ describe('matchOrder', () => {
     expect(result.trades[0].quantity).toBe(3);
     expect(result.trades[0].price).toBe(101);
     expect(result.remainingOrder).toBeNull(); // unfilled 7 qty dropped, does not rest
+    // The caller cannot tell this apart from a full fill using remainingOrder alone —
+    // this is exactly why MatchResult carries filledQuantity.
+    expect(result.filledQuantity).toBe(3);
     expect(book.getBestAsk()).toBeNull();
   });
 
-  it('market order against an empty book fills nothing and does not throw', () => {
+  it('market order against an empty book fills nothing and does not throw (remainingOrder null AND filledQuantity 0)', () => {
     const book = new OrderBook('AAPL');
     const marketBuy = baseOrder({ side: 'BUY', type: 'MARKET', price: null, quantity: 10 });
 
@@ -78,6 +96,7 @@ describe('matchOrder', () => {
 
     expect(result.trades).toHaveLength(0);
     expect(result.remainingOrder).toBeNull();
+    expect(result.filledQuantity).toBe(0);
   });
 
   it('respects price-time priority: older order at the same price fills first', () => {
@@ -101,6 +120,7 @@ describe('matchOrder', () => {
 
     expect(result.trades).toHaveLength(0);
     expect(result.remainingOrder).not.toBeNull();
+    expect(result.filledQuantity).toBe(0);
     expect(book.getBestBid()?.id).toBe('buy-1');
   });
 

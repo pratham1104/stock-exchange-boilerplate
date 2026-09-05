@@ -2,6 +2,7 @@
 import 'dotenv/config';
 import { createApp } from './app';
 import { connectProducer, disconnectProducer } from './kafka/kafkaclient';
+import { attachMarketData } from './ws/marketData';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 
@@ -14,7 +15,11 @@ async function start() {
     console.log(`Exchange API listening on port ${PORT}`);
   });
 
+  const marketData = attachMarketData(server);
+  console.log(`Market-data WebSocket at ws://localhost:${PORT}/ws/market-data`);
+
   const shutdown = async () => {
+    marketData.close();
     server.close();
     await disconnectProducer();
     process.exit(0);

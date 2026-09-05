@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import { OrderBook } from './OrderBook';
 import { matchOrder } from './matchOrder';
 import {
@@ -6,16 +7,40 @@ import {
   OrderAcceptedEvent,
   TradeExecutedEvent,
   OrderCancelledEvent,
+  Trade,
+  BookSnapshot,
 } from '../types/domain';
 import { producer, TOPICS } from '../kafka/kafkaclient';
+
+/** Typed events ExchangeService emits for in-process consumers (e.g. the WebSocket market-data layer). */
+export interface ExchangeServiceEvents {
+  trade: (trade: Trade) => void;
+  book: (symbol: string, snapshot: BookSnapshot) => void;
+}
 
 /**
  * In-memory registry of one OrderBook per symbol.
  * This is intentionally a single-process, single-instance service for now —
  * see Phase 6 in the roadmap for sharding this by symbol across processes.
+ *
+ * Also an EventEmitter: emits 'trade' (once per trade) and 'book' (once per
+ * symbol whose book changed) after every submit/cancel, so same-process
+ * consumers like the market-data WebSocket layer don't have to round-trip
+ * through Kafka to see fresh state. This is separate from and in addition to
+ * the Kafka publish below — Kafka is the durable audit log, this is a live
+ * fan-out fast path.
  */
-export class ExchangeService {
+export class ExchangeService extends EventEmitter {
   private books = new Map<string, OrderBook>();
+
+  // Narrow EventEmitter's untyped on/emit to ExchangeServiceEvents for these two call sites.
+  on<K extends keyof ExchangeServiceEvents>(event: K, listener: ExchangeServiceEvents[K]): this {
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  emit<K extends keyof ExchangeServiceEvents>(event: K, ...args: Parameters<ExchangeServiceEvents[K]>): boolean {
+    return super.emit(event, ...args);
+  }
 
   /** Lazily creates a book the first time a symbol is traded. */
   private getOrCreateBook(symbol: string): OrderBook {
@@ -69,6 +94,13 @@ export class ExchangeService {
       );
     }
 
+    for (const trade of result.trades) this.emit('trade', trade);
+    // Emit the fresh snapshot whenever the book could have changed: a trade
+    // consumed liquidity, or the order itself started resting.
+    if (result.trades.length > 0 || result.remainingOrder) {
+      this.emit('book', order.symbol, this.getSnapshot(order.symbol));
+    }
+
     return result;
   }
 
@@ -82,6 +114,8 @@ export class ExchangeService {
 
     const cancelled: OrderCancelledEvent = { type: 'OrderCancelled', orderId: removed.id, symbol };
     await this.publish(TOPICS.ORDER_CANCELLED, [{ key: removed.id, value: JSON.stringify(cancelled) }]);
+
+    this.emit('book', symbol, this.getSnapshot(symbol));
 
     return removed;
   }
